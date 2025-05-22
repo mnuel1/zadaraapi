@@ -4,8 +4,14 @@ import time
 import os
 from datetime import datetime
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 TOKEN_FILE = "auth_token.json"
 RESPONSE_FILE = "response_data.json"
+MAX_RETRIES = 3
+RETRY_DELAY = 5  # seconds
 
 
 def log(msg):
@@ -13,10 +19,7 @@ def log(msg):
 
 
 def authenticate(url, username, password, account_name):
-    headers = {
-        "Content-Type": "application/json"
-    }
-
+    headers = {"Content-Type": "application/json"}
     payload = {
         "auth": {
             "identity": {
@@ -25,17 +28,13 @@ def authenticate(url, username, password, account_name):
                     "user": {
                         "name": username,
                         "password": password,
-                        "domain": {
-                            "name": account_name
-                        }
+                        "domain": {"name": account_name}
                     }
                 }
             },
             "scope": {
                 "project": {
-                    "domain": {
-                    "name": account_name
-                    },
+                    "domain": {"name": account_name},
                     "name": "default"
                 }
             }
@@ -48,22 +47,13 @@ def authenticate(url, username, password, account_name):
             token = response.headers.get("X-Subject-Token")
             with open(TOKEN_FILE, "w") as f:
                 json.dump({"token": token, "timestamp": int(time.time())}, f)
-            log("Authentication successful. Token saved.")
+            log("Authentication successful.")
             return token
         else:
-            log(f"Authentication failed. Status code: {response.status_code}")
+            log(f"Authentication failed: {response.status_code}")
             log(response.text)
-            return None
     except requests.exceptions.RequestException as e:
         log(f"Auth error: {e}")
-        return None
-
-
-def load_token():
-    if os.path.exists(TOKEN_FILE):
-        with open(TOKEN_FILE, "r") as f:
-            token_data = json.load(f)
-            return token_data.get("token")
     return None
 
 
@@ -79,56 +69,58 @@ def vm_action(endpoint, vm_id, token, action):
         response = requests.post(url, headers=headers, json=action, verify=False)
         if response.status_code == 200:
             data = response.json()
-            with open(RESPONSE_FILE, "w") as json_file:
-                json.dump(data, json_file, indent=4)
-            log(f"VM action '{action['action']}' successful.")
+            log(f"VM {vm_id} action '{action['action']}' successful.")
+            return True
         else:
-            log(f"VM action failed. Status code: {response.status_code}")
+            log(f"VM {vm_id} action failed. Status: {response.status_code}")
             log(response.text)
+            return False
     except requests.exceptions.RequestException as e:
-        log(f"VM action error: {e}")
+        log(f"VM {vm_id} action error: {e}")
+        return False
 
 
-def get_vms(url, token):
-    headers = {
-        "accept": "application/json",
-        "X-Auth-Token": token
-    }
+def process_batches(endpoint, token, batches, action):
+    for batch_index, batch in enumerate(batches, start=1):
+        log(f"\nStarting batch {batch_index} with VMs: {batch}")
+        attempts = 0
+        success = False
 
-    try:
-        response = requests.get(url, headers=headers, verify=False)
-        if response.status_code == 200:
-            data = response.json()
-            with open(RESPONSE_FILE, "w") as json_file:
-                json.dump(data, json_file, indent=4)
-            log("VMs fetched successfully.")
-        else:
-            log(f"Failed to retrieve VMs. Status code: {response.status_code}")
-            log(response.text)
-    except requests.exceptions.RequestException as e:
-        log(f"Get VMs error: {e}")
+        while attempts < MAX_RETRIES and not success:
+            success = True  # Assume success unless one VM fails
+            for vm_id in batch:
+                vm_success = vm_action(endpoint, vm_id, token, action)
+                if not vm_success:
+                    success = False
+                    log(f"Retry attempt {attempts + 1} failed for VM: {vm_id}")
+            if not success:
+                attempts += 1
+                if attempts < MAX_RETRIES:
+                    log(f"Retrying batch {batch_index} after {RETRY_DELAY} seconds...")
+                    time.sleep(RETRY_DELAY)
+                else:
+                    log(f"Batch {batch_index} failed after {MAX_RETRIES} attempts.")
+            else:
+                log(f"Batch {batch_index} completed successfully.")
+                break
 
 
 if __name__ == "__main__":
-    # Configuration (fill in or use environment variables for security)
-    ENDPOINT = "27.126.152.210"
+    ENDPOINT = os.getenv("AUTH_ENDPOINT")
+    USERNAME = os.getenv("AUTH_USERNAME")
+    PASSWORD = os.getenv("AUTH_PASSWORD")
+    ACCOUNT_NAME = os.getenv("AUTH_ACCOUNT_NAME")
     AUTH_URL = f"https://{ENDPOINT}/api/v2/identity/auth"
-    USERNAME = "sandzsupport"
-    PASSWORD = "Peas+ahQyg1"
-    ACCOUNT_NAME = "cloud_msp"
+    ON_ACTION = {"action": "powerup"}
+    OFF_ACTION = {"action": "shutdown", "force": False}
 
-    VM_ID = ["5435bf96-3911-4ae5-adf1-97d47fb890cf"]
+    # Define your VM batches here (list of list)
+    VM_BATCHES = [
+        ["5435bf96-3911-4ae5-adf1-97d47fb890cf"]
+    ]
 
-    # Choose action (manually set or pass via CLI args or env vars)
-    ACTION = {"action": "powerup"}
-    # ACTION = {"action": "shutdown", "force": False}
-
-    # Step 1: Authenticate and save token every 4 hours (run via cron)
     token = authenticate(AUTH_URL, USERNAME, PASSWORD, ACCOUNT_NAME)
-
     if token:
-        vm_action(ENDPOINT, VM_ID, token, ACTION)
-        # Optional: get VMs
-        # get_vms("https://27.126.152.210/api/v2/compute/vms", token)
+        process_batches(ENDPOINT, token, VM_BATCHES, ACTION)
     else:
-        log("Token not available. Skipping VM action.")
+        log("Authentication failed. Skipping batch processing.")
